@@ -31,9 +31,19 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v2
 
-    - name: Fetch all history for all tags and branches
-      run: git fetch --unshallow && git checkout develop && git checkout main
+    # - name: Fetch all history for all tags and branches
+    #   run: git fetch --unshallow && git checkout develop && git checkout main
 
+    - name: Fetch all history for all tags and branches
+      run: git fetch --unshallow
+
+    - name: Checkout develop branch
+      run: git checkout develop
+
+    - name: Checkout main branch
+      run: git checkout main
+
+      
     - name: Checkout to branch
       run: |
         if [ "${GITHUB_EVENT_NAME}" = 'push' ]; then
