@@ -22,8 +22,11 @@ env:
   GITVERSION_TAG_PROPERTY_HOTFIX: .MajorMinorPatch,.PreReleaseLabelWithDash
   GITVERSION_TAG_PROPERTY_MAIN: .MajorMinorPatch
 
-jobs:
+permissions:
+  contents: write
+  pull-requests: write
   
+jobs:
   gitversion:
     name: gitversion
     runs-on: self-hosted  # Changed from ubuntu-18.04 to self-hosted
