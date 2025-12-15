@@ -1,0 +1,101 @@
+# Use this YAML in your workflow file for each job
+
+on:
+  pull_request:
+    branches:
+    - develop
+    - main
+  push:
+    branches:
+    - develop
+    - main
+    - 'release/**'
+    - 'hotfix/**'
+
+env:
+  GITVERSION: 'gittools/gitversion:5.10.0-alpine.3.14-6.0'
+  MAIN_BRANCHES: ("develop" "main")
+  GITVERSION_TAG_PROPERTY_PULL_REQUESTS: .SemVer
+  GITVERSION_TAG_PROPERTY_DEFAULT: .SemVer
+  GITVERSION_TAG_PROPERTY_DEVELOP: .MajorMinorPatch,.PreReleaseLabelWithDash
+  GITVERSION_TAG_PROPERTY_RELEASE: .MajorMinorPatch,.PreReleaseLabelWithDash
+  GITVERSION_TAG_PROPERTY_HOTFIX: .MajorMinorPatch,.PreReleaseLabelWithDash
+  GITVERSION_TAG_PROPERTY_MAIN: .MajorMinorPatch
+
+permissions:
+  contents: write
+  pull-requests: write
+  
+jobs:
+  gitversion:
+    name: gitversion
+    runs-on: self-hosted  # Changed from ubuntu-18.04 to self-hosted
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+    
+    # - name: Fetch all history for all tags and branches
+    #   run: git fetch --unshallow && git checkout develop && git checkout main
+    - name: Update PR description
+      if: ${{ github.event_name == 'pull_request' }}
+      run: |
+        $PR_NUMBER = ($env:GITHUB_REF -split '/')[2]
+        
+        # Simple approach - construct the body directly
+        $body_content = "## impact surface`nService versions will be calculated here."
+        
+        $payload = @{
+          body = $body_content
+        } | ConvertTo-Json -Compress
+        
+        $headers = @{
+          "Authorization" = "token ${{ secrets.GITHUB_TOKEN }}"
+          "Content-Type" = "application/json"
+        }
+        
+        $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/pulls/$PR_NUMBER"
+        
+        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+        
+        try {
+          Invoke-RestMethod -Uri $uri -Method PATCH -Headers $headers -Body $bodyBytes
+          Write-Host "PR description updated successfully"
+        } catch {
+          Write-Error "Failed to update PR: $($_.Exception.Message)"
+          if ($_.ErrorDetails) {
+            Write-Host "Error details: $($_.ErrorDetails.Message)"
+          }
+        }
+      shell: powershell
+    - name: Tag build
+      if: ${{ github.event_name == 'push' && (startsWith(steps.calculate_changed_services.outputs.diff_dest, 'release') || startsWith(steps.calculate_changed_services.outputs.diff_dest, 'hotfix') || contains(env.MAIN_BRANCHES, steps.calculate_changed_services.outputs.diff_dest)) }}
+      run: |
+        # https://github.com/orgs/community/discussions/26560
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        git config --global user.name "github-actions"
+        changed_services=( ${{ fromJSON(steps.calculate_changed_services.outputs.changed_services) }} )
+        for svc in "${changed_services[@]}"; do
+          echo "calculation for ${svc}"
+          docker run --rm -v "$(pwd):/repo" ${GITVERSION} /repo /config "/repo/${svc}/.gitversion.yml"
+          gitversion_calc=$(docker run --rm -v "$(pwd):/repo" ${GITVERSION} /repo /config "/repo/${svc}/.gitversion.yml")
+          GITVERSION_TAG_PROPERTY_NAME="GITVERSION_TAG_PROPERTY_$(echo '${{ steps.calculate_changed_services.outputs.diff_dest }}' | sed 's|/.*$||' | tr '[[:lower:]]' '[[:upper:]]')"
+          GITVERSION_TAG_PROPERTY=${!GITVERSION_TAG_PROPERTY_NAME}
+          svc_without_prefix=$(echo "${svc}" | sed "s|^apps/||")
+          service_version=$(echo "${gitversion_calc}" | jq -r "[${GITVERSION_TAG_PROPERTY}] | join(\"\")")
+          if [ "${GITVERSION_TAG_PROPERTY}" != ".MajorMinorPatch" ]; then
+            echo tag_filter "^${svc_without_prefix}/v$(echo "${gitversion_calc}" | jq -r ".MajorMinorPatch")-$(echo "${gitversion_calc}" | jq -r ".PreReleaseLabel")"
+            echo tags with tag_filter "$(git tag -l | grep "^${svc_without_prefix}/v$(echo "${gitversion_calc}" | jq -r ".MajorMinorPatch")-$(echo "${gitversion_calc}" | jq -r ".PreReleaseLabel")")"
+            echo tags grepped on commit count "$(git tag -l | grep "^${svc_without_prefix}/v$(echo "${gitversion_calc}" | jq -r ".MajorMinorPatch")-$(echo "${gitversion_calc}" | jq -r ".PreReleaseLabel")" | grep -o -E '\.[0-9]+$')"
+            echo tags grepped on commit count and period removed "$(git tag -l | grep "^${svc_without_prefix}/v$(echo "${gitversion_calc}" | jq -r ".MajorMinorPatch")-$(echo "${gitversion_calc}" | jq -r ".PreReleaseLabel")" | grep -o -E '\.[0-9]+$' | grep -o -E '[0-9]+$')"
+            previous_commit_count=$(git tag -l | grep "^${svc_without_prefix}/v$(echo "${gitversion_calc}" | jq -r ".MajorMinorPatch")-$(echo "${gitversion_calc}" | jq -r ".PreReleaseLabel")" | grep -o -E '\.[0-9]+$' | grep -o -E '[0-9]+$' | sort -nr | head -1)
+            echo previous_commit_count $previous_commit_count
+            next_commit_count=$((previous_commit_count+1))
+            echo next_commit_count $next_commit_count
+            full_service_version="${service_version}.${next_commit_count"
+          else
+            full_service_version="${service_version}"
+          fi
+          git tag -a "${svc_without_prefix}/v${full_service_version}" -m "${svc_without_prefix}/v${full_service_version}"
+          git push origin "${svc_without_prefix}/v${full_service_version}"
+        done
+      shell: powershell
