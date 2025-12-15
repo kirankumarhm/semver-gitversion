@@ -1,3 +1,5 @@
+# Use this YAML in your workflow file for each job
+
 on:
   pull_request:
     branches:
@@ -21,18 +23,16 @@ env:
   GITVERSION_TAG_PROPERTY_MAIN: .MajorMinorPatch
 
 jobs:
+  
   gitversion:
     name: gitversion
-    runs-on: ubuntu-18.04
+    runs-on: self-hosted  # Changed from ubuntu-18.04 to self-hosted
     steps:
     - name: Checkout
       uses: actions/checkout@v2
 
     - name: Fetch all history for all tags and branches
       run: git fetch --unshallow && git checkout develop && git checkout main
-
-    #- name: Check base ref
-    #  run: echo "baseref='$GITHUB_BASE_REF' ref='$GITHUB_REF' headref='$GITHUB_HEAD_REF' refname='$GITHUB_REF_NAME' eventname='$GITHUB_EVENT_NAME'"
 
     - name: Checkout to branch
       run: |
@@ -136,7 +136,7 @@ jobs:
             echo previous_commit_count $previous_commit_count
             next_commit_count=$((previous_commit_count+1))
             echo next_commit_count $next_commit_count
-            full_service_version="${service_version}.${next_commit_count}"
+            full_service_version="${service_version}.${next_commit_count"
           else
             full_service_version="${service_version}"
           fi
