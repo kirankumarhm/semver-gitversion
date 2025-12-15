@@ -44,14 +44,20 @@ jobs:
       run: git checkout main
 
       
+    # - name: Checkout to branch
+    #   run: |
+    #     if [ "${GITHUB_EVENT_NAME}" = 'push' ]; then
+    #       DIFF_DEST="${GITHUB_REF_NAME}"
+    #     else
+    #       DIFF_DEST="${GITHUB_HEAD_REF}"
+    #     fi
+    #     git checkout ${DIFF_DEST}
+
     - name: Checkout to branch
       run: |
-        if [ "${GITHUB_EVENT_NAME}" = 'push' ]; then
-          DIFF_DEST="${GITHUB_REF_NAME}"
-        else
-          DIFF_DEST="${GITHUB_HEAD_REF}"
-        fi
-        git checkout ${DIFF_DEST}
+        git checkout %GITHUB_REF_NAME%
+      shell: cmd
+
 
     - name: Calculate changed services
       id: calculate_changed_services
