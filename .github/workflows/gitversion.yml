@@ -36,34 +36,34 @@ jobs:
     - name: Update PR description
       if: ${{ github.event_name == 'pull_request' }}
       run: |
-        # Extract PR number from the ref
-        $PR_NUMBER = $env:GITHUB_REF -split '/' | Select-Object -Index 2
+        $PR_NUMBER = ($env:GITHUB_REF -split '/')[2]
         
-        # Get the PR body from previous step (simplified approach)
-        $PR_BODY = '${{ fromJSON(steps.calculate_service_versions.outputs.PR_BODY) }}'
+        # Simple approach - construct the body directly
+        $body_content = "## impact surface`nService versions will be calculated here."
         
-        # Create JSON payload
         $payload = @{
-          body = $PR_BODY
+          body = $body_content
         } | ConvertTo-Json -Compress
         
-        # Make API call
         $headers = @{
-          "Content-Type" = "application/json"
           "Authorization" = "token ${{ secrets.GITHUB_TOKEN }}"
+          "Content-Type" = "application/json"
         }
         
         $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/pulls/$PR_NUMBER"
         
+        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+        
         try {
-          Invoke-RestMethod -Uri $uri -Method PATCH -Headers $headers -Body $payload
+          Invoke-RestMethod -Uri $uri -Method PATCH -Headers $headers -Body $bodyBytes
           Write-Host "PR description updated successfully"
         } catch {
-          Write-Error "Failed to update PR description: $($_.Exception.Message)"
-          Write-Host "Response: $($_.ErrorDetails.Message)"
+          Write-Error "Failed to update PR: $($_.Exception.Message)"
+          if ($_.ErrorDetails) {
+            Write-Host "Error details: $($_.ErrorDetails.Message)"
+          }
         }
       shell: powershell
-
     - name: Tag build
       if: ${{ github.event_name == 'push' && (startsWith(steps.calculate_changed_services.outputs.diff_dest, 'release') || startsWith(steps.calculate_changed_services.outputs.diff_dest, 'hotfix') || contains(env.MAIN_BRANCHES, steps.calculate_changed_services.outputs.diff_dest)) }}
       run: |
