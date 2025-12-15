@@ -36,14 +36,34 @@ jobs:
     - name: Update PR description
       if: ${{ github.event_name == 'pull_request' }}
       run: |
-        PR_NUMBER=$(echo $GITHUB_REF | awk 'BEGIN { FS = "/" } ; { print $3 }')
-        # from https://github.com/actions/checkout/issues/58#issuecomment-614041550
-        jq -nc '{"body": "${{ fromJSON(steps.calculate_service_versions.outputs.PR_BODY) }}" }' | \
-        curl -sL  -X PATCH -d @- \
-          -H "Content-Type: application/json" \
-          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-          "https://api.github.com/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER"
+        # Extract PR number from the ref
+        $PR_NUMBER = $env:GITHUB_REF -split '/' | Select-Object -Index 2
+        
+        # Get the PR body from previous step (simplified approach)
+        $PR_BODY = '${{ fromJSON(steps.calculate_service_versions.outputs.PR_BODY) }}'
+        
+        # Create JSON payload
+        $payload = @{
+          body = $PR_BODY
+        } | ConvertTo-Json -Compress
+        
+        # Make API call
+        $headers = @{
+          "Content-Type" = "application/json"
+          "Authorization" = "token ${{ secrets.GITHUB_TOKEN }}"
+        }
+        
+        $uri = "https://api.github.com/repos/$env:GITHUB_REPOSITORY/pulls/$PR_NUMBER"
+        
+        try {
+          Invoke-RestMethod -Uri $uri -Method PATCH -Headers $headers -Body $payload
+          Write-Host "PR description updated successfully"
+        } catch {
+          Write-Error "Failed to update PR description: $($_.Exception.Message)"
+          Write-Host "Response: $($_.ErrorDetails.Message)"
+        }
       shell: powershell
+
     - name: Tag build
       if: ${{ github.event_name == 'push' && (startsWith(steps.calculate_changed_services.outputs.diff_dest, 'release') || startsWith(steps.calculate_changed_services.outputs.diff_dest, 'hotfix') || contains(env.MAIN_BRANCHES, steps.calculate_changed_services.outputs.diff_dest)) }}
       run: |
