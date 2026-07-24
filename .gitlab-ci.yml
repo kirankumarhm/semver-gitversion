@@ -1,0 +1,211 @@
+# ── Prevent duplicate pipelines ──────────────────────────────────────────────
+# Without this, pushing a branch with an open MR triggers both a branch pipeline
+# AND a merge request pipeline for the same commit — build runs twice.
+# This block ensures only ONE pipeline type is created per event.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"   # MR pipeline
+    - if: $CI_COMMIT_BRANCH == "main"                    # branch pipeline on main
+    - if: $CI_COMMIT_BRANCH =~ /^release\/.*/            # branch pipeline on release/*
+    # All other branch pushes → no pipeline created
+
+variables:
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+  IMAGE_NAME: $CI_REGISTRY_IMAGE
+  VERSION_BUMP: "patch"   # patch | minor | major
+  APP_PORT: "8080"
+  CONTAINER_NAME: "hello-versioning-demo"
+
+cache:
+  paths:
+    - .m2/repository
+
+stages:
+  - build
+  - version-bump
+  - docker
+  - deploy
+
+# ─── BUILD ────────────────────────────────────────────────────────────────────
+build:
+  stage: build
+  image: maven:3.9-eclipse-temurin-21-alpine
+  script:
+    - mvn clean package -DskipTests
+  artifacts:
+    paths:
+      - target/*.jar
+    expire_in: 1 hour
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"   # compile check on MR
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH =~ /^release\/.*/
+
+# ─── VERSION BUMP ─────────────────────────────────────────────────────────────
+version-bump:
+  stage: version-bump
+  image: maven:3.9-eclipse-temurin-21-alpine
+  needs:
+    - job: build       # only bump if build succeeds
+  before_script:
+    - apk add --no-cache git
+    - git config user.email "ci@gitlab.com"
+    - git config user.name "GitLab CI"
+    - git remote set-url origin "https://oauth2:${GIT_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    # Use stored fingerprint — never blindly trust ssh-keyscan
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - echo "$GITLAB_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+  script:
+    - NEW_VERSION=$(sh bump-version.sh "$VERSION_BUMP")
+    # Guard against tag collision
+    - |
+      if git ls-remote --tags origin | grep -q "refs/tags/v${NEW_VERSION}$"; then
+        echo "ERROR: tag v${NEW_VERSION} already exists. Bump a higher segment or delete the tag first."
+        mvn versions:revert   # restore pom.xml from backup
+        exit 1
+      fi
+    - mvn versions:commit     # success — remove pom.xml.versionsBackup
+    - git add pom.xml
+    - git commit -m "chore: bump version to ${NEW_VERSION} [skip ci]"
+    - git tag "v${NEW_VERSION}"
+    - git push origin HEAD:$CI_COMMIT_REF_NAME --tags
+    - echo "NEW_VERSION=${NEW_VERSION}" >> version.env
+  artifacts:
+    reports:
+      dotenv: version.env
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH =~ /^release\/.*/
+
+# ─── DOCKER BUILD & PUSH ──────────────────────────────────────────────────────
+docker-build:
+  stage: docker
+  image: docker:26.1.4-alpine
+  services:
+    - docker:26.1.4-dind
+  needs:
+    - job: build
+      artifacts: true
+    - job: version-bump
+      artifacts: true
+  script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker build -t "$IMAGE_NAME:$NEW_VERSION" -t "$IMAGE_NAME:latest" .
+    - docker push "$IMAGE_NAME:$NEW_VERSION"
+    - docker push "$IMAGE_NAME:latest"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH =~ /^release\/.*/
+
+# ─── DEPLOY TEMPLATE ──────────────────────────────────────────────────────────
+.deploy-template:
+  stage: deploy
+  image: alpine:3.19
+  needs:
+    - job: docker-build
+    - job: version-bump
+      artifacts: true
+  before_script:
+    - apk add --no-cache openssh-client curl
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    # Use stored fingerprint — never blindly trust ssh-keyscan
+    - echo "$DEPLOY_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+  script:
+    # ── Pull new image on the server ──
+    - |
+      ssh "$DEPLOY_USER@$DEPLOY_HOST" "
+        docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY &&
+        docker pull $IMAGE_NAME:$NEW_VERSION
+      "
+    # ── Zero-downtime swap: start new → verify healthy → stop old ──
+    - |
+      ssh "$DEPLOY_USER@$DEPLOY_HOST" "
+        docker run -d \
+          --name ${CONTAINER_NAME}-next \
+          -p 8081:${APP_PORT} \
+          --restart unless-stopped \
+          $IMAGE_NAME:$NEW_VERSION
+      "
+    # ── Health check: poll new container on staging port 8081 ──
+    - |
+      echo "Waiting for new container to be healthy..."
+      for i in $(seq 1 12); do
+        sleep 5
+        STATUS=$(ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+          "curl -sf http://localhost:8081/actuator/health | grep -c '\"status\":\"UP\"' || true")
+        if [ "$STATUS" = "1" ]; then
+          echo "Health check passed on attempt $i"
+          break
+        fi
+        echo "Attempt $i/12 — not healthy yet..."
+        if [ "$i" = "12" ]; then
+          echo "ERROR: new container failed health check. Rolling back."
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            "docker stop ${CONTAINER_NAME}-next && docker rm ${CONTAINER_NAME}-next"
+          exit 1
+        fi
+      done
+    # ── Swap: stop old, rename new to canonical name, remap to production port ──
+    - |
+      ssh "$DEPLOY_USER@$DEPLOY_HOST" "
+        docker stop $CONTAINER_NAME 2>/dev/null || true &&
+        docker rm   $CONTAINER_NAME 2>/dev/null || true &&
+        docker stop ${CONTAINER_NAME}-next &&
+        docker rm   ${CONTAINER_NAME}-next &&
+        docker run -d \
+          --name $CONTAINER_NAME \
+          -p ${APP_PORT}:${APP_PORT} \
+          --restart unless-stopped \
+          $IMAGE_NAME:$NEW_VERSION
+      "
+    # ── Final health check on production port ──
+    - |
+      echo "Final health check on production port..."
+      for i in $(seq 1 6); do
+        sleep 5
+        STATUS=$(ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+          "curl -sf http://localhost:${APP_PORT}/actuator/health | grep -c '\"status\":\"UP\"' || true")
+        if [ "$STATUS" = "1" ]; then
+          echo "Deployment successful — $IMAGE_NAME:$NEW_VERSION is live."
+          exit 0
+        fi
+        echo "Attempt $i/6..."
+      done
+      echo "ERROR: production health check failed after swap."
+      exit 1
+    # ── Cleanup old images (keep last 3) ──
+    - |
+      ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+        "docker images $IMAGE_NAME --format '{{.Tag}}' | sort -V | head -n -3 | \
+         xargs -I{} docker rmi $IMAGE_NAME:{} 2>/dev/null || true"
+
+# ─── DEPLOY DEV ───────────────────────────────────────────────────────────────
+deploy-dev:
+  extends: .deploy-template
+  variables:
+    SSH_PRIVATE_KEY: $DEV_SSH_PRIVATE_KEY
+    DEPLOY_HOST: $DEV_HOST
+    DEPLOY_USER: $DEV_USER
+    DEPLOY_KNOWN_HOSTS: $DEV_KNOWN_HOSTS
+  environment:
+    name: dev
+    url: http://$DEV_HOST:$APP_PORT
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# ─── DEPLOY PROD ──────────────────────────────────────────────────────────────
+deploy-prod:
+  extends: .deploy-template
+  variables:
+    SSH_PRIVATE_KEY: $PROD_SSH_PRIVATE_KEY
+    DEPLOY_HOST: $PROD_HOST
+    DEPLOY_USER: $PROD_USER
+    DEPLOY_KNOWN_HOSTS: $PROD_KNOWN_HOSTS
+  environment:
+    name: production
+    url: http://$PROD_HOST:$APP_PORT
+  when: manual
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^release\/.*/
